@@ -1,0 +1,26 @@
+{
+  "name": "autochtune",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "portless run vite",
+    "build": "vite build",
+    "preview": "portless run vite preview",
+    "test:audio": "node scripts/audio-routing-test.mjs",
+    "diagnose:vocoder": "node scripts/vocoder-diagnostic.mjs",
+    "hardware:check": "bash scripts/hardware-check.sh",
+    "hardware:json": "bash scripts/hardware-check.sh --json",
+    "hardware:partykeys": "bash scripts/hardware-check.sh --partykeys",
+    "hardware:led-test": "bash scripts/hardware-check.sh --partykeys --led-test",
+    "hardware:microphone": "bash scripts/hardware-check.sh --microphone",
+    "hardware:mic-test": "bash scripts/hardware-check.sh --microphone --mic-test 4"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {}
+}

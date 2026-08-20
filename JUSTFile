@@ -1,0 +1,78 @@
+# Autochtune development recipes
+set shell := ["zsh", "-cu"]
+
+# List available recipes
+default:
+    @just --list --unsorted
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+# Install npm dependencies
+install:
+    npm install
+
+# Remove Vite output, Swift module cache, and node_modules
+clean:
+    rm -rf dist .build node_modules
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+# Start the Vite dev server on a named .localhost URL
+dev:
+    portless run vite
+
+# Create a production build
+build:
+    npm run build
+
+# Preview the production build on a named .localhost URL
+preview:
+    portless run vite preview
+
+# ---------------------------------------------------------------------------
+# Tests + diagnostics
+# ---------------------------------------------------------------------------
+
+# Offline audio-routing assertions (monitor vs keyed vocoder)
+test:
+    node scripts/audio-routing-test.mjs
+
+# Vocoder diagnostic against the bundled Prufrock sample
+diagnose *args:
+    node scripts/vocoder-diagnostic.mjs {{args}}
+
+# Vocoder diagnostic, writing WAV artifacts to dest
+diagnose-write dest="/tmp/autochtune-vocoder-diagnostic":
+    node scripts/vocoder-diagnostic.mjs --write {{dest}}
+
+# ---------------------------------------------------------------------------
+# Hardware (macOS)
+# ---------------------------------------------------------------------------
+
+# Full non-invasive USB / MIDI / microphone inventory
+hardware:
+    bash scripts/hardware-check.sh
+
+# Machine-readable hardware inventory
+hardware-json:
+    bash scripts/hardware-check.sh --json
+
+# PartyKeys USB + CoreMIDI discovery
+partykeys:
+    bash scripts/hardware-check.sh --partykeys
+
+# Reversible C4/E4/G4 RGB write test; lights clear after 1.5 seconds
+led-test:
+    bash scripts/hardware-check.sh --partykeys --led-test
+
+# Recording-input inventory
+microphone:
+    bash scripts/hardware-check.sh --microphone
+
+# Input-quality capture; sing during the measurement
+mic-test seconds="4":
+    bash scripts/hardware-check.sh --microphone --mic-test {{seconds}}
