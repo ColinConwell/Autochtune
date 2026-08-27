@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { VocoderEngine } from './audio/VocoderEngine.js'
+import { createScheduler } from './lib/scheduler.js'
 import {
   PARTYKEYS_RANGE,
   clearKeyColors,
   connectPartyKeys,
   hexToRgb,
+  isPartyKeysNote,
   noteName,
+  noteToKeyIndex,
+  parseMidiNote,
+  scaleRgb,
   setKeyColors,
 } from './lib/partykeys.js'
 
@@ -31,12 +36,27 @@ const PRESETS = {
 
 const DEMO_BPM = 88
 const DEMO_BEATS_PER_CHORD = 4
+const DEMO_VELOCITY = 96
 const DEMO_CHORDS = [
   { name: 'Cmaj7', notes: [60, 64, 67, 71], color: '#ff684f' },
   { name: 'Am7', notes: [57, 60, 64, 67], color: '#f59f45' },
   { name: 'Fmaj7', notes: [53, 57, 60, 64], color: '#b7dc26' },
   { name: 'Gsus4', notes: [55, 60, 62, 67], color: '#5aa8ff' },
 ]
+
+const PATCH_STORAGE_KEY = 'autochtune.patches.v1'
+
+function loadUserPatches() {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(PATCH_STORAGE_KEY) ?? '{}')
+    if (!stored || typeof stored !== 'object') return {}
+    // Stored patches are merged over the defaults, so an old or partial entry
+    // cannot leave a setting undefined.
+    return Object.fromEntries(Object.entries(stored).map(([name, patch]) => [name, { ...INITIAL_SETTINGS, ...patch }]))
+  } catch {
+    return {}
+  }
+}
 
 const PARAMS = {
   tune: { label: 'Tune', min: -12, max: 12, step: 1, unit: ' st' },
@@ -59,6 +79,22 @@ function formatValue(value, config) {
   if (config.format) return config.format(value)
   const prefix = config.signed && value > 0 ? '+' : ''
   return `${prefix}${value}${config.unit ?? ''}`
+}
+
+// LED "Pitch classes" and "Velocity heatmap" modes need a hue ramp; the colour
+// pickers only cover the "Active notes" mode.
+function hslToRgb(hue, saturation, lightness) {
+  const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation
+  const sector = ((hue % 360) + 360) % 360 / 60
+  const second = chroma * (1 - Math.abs(sector % 2 - 1))
+  const [r, g, b] = sector < 1 ? [chroma, second, 0]
+    : sector < 2 ? [second, chroma, 0]
+      : sector < 3 ? [0, chroma, second]
+        : sector < 4 ? [0, second, chroma]
+          : sector < 5 ? [second, 0, chroma]
+            : [chroma, 0, second]
+  const match = lightness - chroma / 2
+  return { r: (r + match) * 255, g: (g + match) * 255, b: (b + match) * 255 }
 }
 
 function formatTime(seconds) {
@@ -249,17 +285,21 @@ function DeviceDrawer({ open, onToggle, midi, led, setLed, onIdentify, log, onCl
 }
 
 export default function App() {
-  const engine = useRef(new VocoderEngine())
+  const engineRef = useRef(null)
+  if (!engineRef.current) engineRef.current = new VocoderEngine()
+  const engine = engineRef
   const midiOutput = useRef(null)
-  const demoTimers = useRef([])
+  const demoSchedulers = useRef([])
   const demoRun = useRef(0)
   const demoChordNotes = useRef([])
-  const activeNotesRef = useRef(new Set())
+  const activeNotesRef = useRef(new Map())
   const mediaRef = useRef(null)
   const uploadUrlRef = useRef(null)
   const [settings, setSettings] = useState(INITIAL_SETTINGS)
   const [activePreset, setActivePreset] = useState('Glass Choir')
-  const [activeNotes, setActiveNotes] = useState(new Set())
+  const [userPatches, setUserPatches] = useState(loadUserPatches)
+  const patches = useMemo(() => ({ ...PRESETS, ...userPatches }), [userPatches])
+  const [activeNotes, setActiveNotes] = useState(new Map())
   const [audio, setAudio] = useState({ started: false, loading: false, error: '' })
   const [levels, setLevels] = useState({ inputDb: -60, outputDb: -60, carrierDb: -60, wetDb: -60, effectActive: false })
   const [sourceMode, setSourceMode] = useState('microphone')
@@ -275,6 +315,26 @@ export default function App() {
     { id: 1, time: 'Ready', type: 'Waiting', note: '—', velocity: '—', channel: '1' },
   ])
 
+  // The LED mode picker offers four behaviours; each one has to resolve to an
+  // actual colour or the control is decorative.
+  const ledColorFor = useCallback((note, velocity) => {
+    if (led.mode === 'Off') return { r: 0, g: 0, b: 0 }
+    if (led.mode === 'Pitch classes') {
+      const hue = ((note % 12) / 12) * 360
+      return scaleRgb(hslToRgb(hue, 0.72, 0.55), led.brightness / 100)
+    }
+    if (led.mode === 'Velocity heatmap') {
+      const amount = Math.max(0, Math.min(1, velocity / 127))
+      return scaleRgb(hslToRgb(220 - amount * 220, 0.8, 0.55), led.brightness / 100)
+    }
+    return scaleRgb(hexToRgb(led.active), led.brightness / 100)
+  }, [led.mode, led.active, led.brightness])
+
+  const ledIdleColor = useCallback(
+    () => (led.mode === 'Off' ? { r: 0, g: 0, b: 0 } : hexToRgb(led.idle)),
+    [led.mode, led.idle],
+  )
+
   const updateSetting = (name, value) => {
     const next = { ...settings, [name]: value }
     setSettings(next)
@@ -282,38 +342,51 @@ export default function App() {
   }
 
   const noteOn = useCallback((note, velocity = 100, channel = 1) => {
-    activeNotesRef.current.add(note)
-    setActiveNotes((current) => new Set(current).add(note))
+    activeNotesRef.current.set(note, velocity)
+    setActiveNotes(new Map(activeNotesRef.current))
     engine.current.noteOn(note, velocity)
-    const rgb = hexToRgb(led.active)
-    const amount = led.brightness / 100
-    setKeyColors(midiOutput.current, [{ color: { r: rgb.r * amount, g: rgb.g * amount, b: rgb.b * amount }, keys: [note - 48] }])
-    setLog((items) => [{ id: Date.now() + note, time: new Date().toLocaleTimeString([], { hour12: false }), type: 'Note On', note: noteName(note), velocity, channel }, ...items].slice(0, 24))
-  }, [led.active, led.brightness])
+    // Only PartyKeys' own 36 keys have LEDs; a note from any other source would
+    // encode to an out-of-range key index and invalidate the whole SysEx frame.
+    if (isPartyKeysNote(note)) {
+      setKeyColors(midiOutput.current, [{ color: ledColorFor(note, velocity), keys: [noteToKeyIndex(note)] }])
+    }
+    setLog((items) => [{ id: `${Date.now()}-${note}-on`, time: new Date().toLocaleTimeString([], { hour12: false }), type: 'Note On', note: noteName(note), velocity, channel }, ...items].slice(0, 24))
+  }, [ledColorFor])
 
   const noteOff = useCallback((note, channel = 1) => {
     activeNotesRef.current.delete(note)
-    setActiveNotes((current) => { const next = new Set(current); next.delete(note); return next })
+    setActiveNotes(new Map(activeNotesRef.current))
     engine.current.noteOff(note)
-    const idle = led.mode === 'Off' ? { r: 0, g: 0, b: 0 } : hexToRgb(led.idle)
-    setKeyColors(midiOutput.current, [{ color: idle, keys: [note - 48] }])
-    setLog((items) => [{ id: Date.now() + note, time: new Date().toLocaleTimeString([], { hour12: false }), type: 'Note Off', note: noteName(note), velocity: 0, channel }, ...items].slice(0, 24))
-  }, [led.idle, led.mode])
+    if (isPartyKeysNote(note)) {
+      setKeyColors(midiOutput.current, [{ color: ledIdleColor(), keys: [noteToKeyIndex(note)] }])
+    }
+    setLog((items) => [{ id: `${Date.now()}-${note}-off`, time: new Date().toLocaleTimeString([], { hour12: false }), type: 'Note Off', note: noteName(note), velocity: 0, channel }, ...items].slice(0, 24))
+  }, [ledIdleColor])
 
   const handleMidi = useCallback((event) => {
-    const [status, note, velocity] = event.data
-    const command = status & 0xf0
-    const channel = (status & 0x0f) + 1
-    if (command === 0x90 && velocity > 0 && note >= 48 && note <= 83) noteOn(note, velocity, channel)
-    if (command === 0x80 || (command === 0x90 && velocity === 0)) noteOff(note, channel)
+    const message = parseMidiNote(event.data)
+    if (!message) return
+    if (message.type === 'noteOn') noteOn(message.note, message.velocity, message.channel)
+    else noteOff(message.note, message.channel)
   }, [noteOff, noteOn])
 
   const connectMidi = async () => {
     try {
-      const result = await connectPartyKeys(handleMidi)
+      const result = await connectPartyKeys(handleMidi, (state) => {
+        // Re-plugging the keyboard swaps the port objects; the LED-mode frame is
+        // re-sent by connectPartyKeys, so only the UI needs catching up here.
+        midiOutput.current = state.connected ? result.output : null
+        setMidi((current) => ({ ...current, connected: state.connected, name: state.name || current.name }))
+      })
       midiOutput.current = result.output
-      setMidi({ connected: true, name: result.output.name || 'PartyKeys 36', error: '' })
-      setLog((items) => [{ id: Date.now(), time: 'Now', type: 'Connected', note: '—', velocity: '—', channel: '1' }, ...items])
+      setMidi({
+        connected: true,
+        name: result.output.name || 'MIDI device',
+        // Falling back to whatever MIDI device is present is useful, but calling
+        // it a PartyKeys when it is not would hide why the LEDs stay dark.
+        error: result.identified ? '' : `Connected to "${result.output.name}" — no PartyKeys was found, so LED control may not work.`,
+      })
+      setLog((items) => [{ id: Date.now(), time: 'Now', type: 'Connected', note: '—', velocity: '—', channel: '1' }, ...items].slice(0, 24))
       return true
     } catch (error) {
       setMidi({ connected: false, name: 'PartyKeys 36', error: error.message })
@@ -326,7 +399,7 @@ export default function App() {
     try {
       engine.current.update(settings)
       await engine.current.start(microphoneId)
-      activeNotesRef.current.forEach((note) => engine.current.noteOn(note, 100))
+      activeNotesRef.current.forEach((velocity, note) => engine.current.noteOn(note, velocity))
       const devices = await navigator.mediaDevices.enumerateDevices()
       const inputs = devices.filter((device) => device.kind === 'audioinput').map((device, index) => ({ deviceId: device.deviceId, label: device.label || `Microphone ${index + 1}` }))
       if (inputs.length) setMicrophones(inputs)
@@ -351,7 +424,7 @@ export default function App() {
     try {
       engine.current.update(settings)
       await engine.current.startMediaElement(player)
-      activeNotesRef.current.forEach((note) => engine.current.noteOn(note, 100))
+      activeNotesRef.current.forEach((velocity, note) => engine.current.noteOn(note, velocity))
       await player.play()
       setPlayback((state) => ({ ...state, playing: true }))
       setAudio({ started: true, loading: false, error: '' })
@@ -403,9 +476,30 @@ export default function App() {
   const startSelectedSource = () => sourceMode === 'sample' ? toggleSamplePlayback() : startMicrophone()
 
   const applyPreset = (name) => {
+    const patch = patches[name]
+    if (!patch) return
     setActivePreset(name)
-    setSettings(PRESETS[name])
-    engine.current.update(PRESETS[name])
+    setSettings(patch)
+    engine.current.update(patch)
+  }
+
+  const stepPreset = (direction) => {
+    const names = Object.keys(patches)
+    const index = names.indexOf(activePreset)
+    applyPreset(names[(index + direction + names.length) % names.length])
+  }
+
+  const savePatch = () => {
+    const name = window.prompt('Save this patch as', activePreset === 'Glass Choir' ? 'My patch' : activePreset)
+    if (!name) return
+    const next = { ...userPatches, [name]: settings }
+    setUserPatches(next)
+    setActivePreset(name)
+    try {
+      window.localStorage.setItem(PATCH_STORAGE_KEY, JSON.stringify(next))
+    } catch {
+      setAudio((state) => ({ ...state, error: 'This browser blocked local storage, so the patch was kept for this session only.' }))
+    }
   }
 
   const identifyLeds = () => {
@@ -416,15 +510,15 @@ export default function App() {
   }
 
   const clearDemoTimers = () => {
-    demoTimers.current.forEach((timer) => window.clearTimeout(timer))
-    demoTimers.current = []
+    demoSchedulers.current.forEach((scheduler) => scheduler.cancel())
+    demoSchedulers.current = []
   }
 
   const releaseDemoChord = () => {
     demoChordNotes.current.forEach((note) => engine.current.noteOff(note))
     demoChordNotes.current = []
     activeNotesRef.current.clear()
-    setActiveNotes(new Set())
+    setActiveNotes(new Map())
   }
 
   const stopDemo = () => {
@@ -451,49 +545,55 @@ export default function App() {
 
     const beatMs = 60000 / DEMO_BPM
     const chordMs = beatMs * DEMO_BEATS_PER_CHORD
-    const queue = (callback, delay) => {
-      const timer = window.setTimeout(() => { if (demoRun.current === run) callback() }, delay)
-      demoTimers.current.push(timer)
+    // Every event is scheduled against one fixed origin so a late chord cannot
+    // push the ones after it off tempo.
+    const scheduler = createScheduler()
+    demoSchedulers.current.push(scheduler)
+    const at = (offsetMs, callback) => scheduler.at(offsetMs, () => {
+      if (demoRun.current === run) callback()
+    })
+
+    for (let beat = 1; beat <= DEMO_BEATS_PER_CHORD; beat += 1) {
+      at((beat - 1) * beatMs, () => setDemo((current) => ({ ...current, beat })))
     }
 
-    for (let beat = 1; beat <= 4; beat += 1) {
-      queue(() => setDemo((current) => ({ ...current, beat })), (beat - 1) * beatMs)
-    }
-
-    const playChord = (step, cycle) => {
+    const playChord = (index) => {
       if (demoRun.current !== run) return
+      const step = index % DEMO_CHORDS.length
+      const cycle = Math.floor(index / DEMO_CHORDS.length)
       const chord = DEMO_CHORDS[step]
-      const rgb = hexToRgb(chord.color)
-      const amount = led.brightness / 100
-      const activeKeys = chord.notes.map((note) => note - PARTYKEYS_RANGE.first)
-      const idleKeys = Array.from({ length: PARTYKEYS_RANGE.count }, (_, index) => index).filter((index) => !activeKeys.includes(index))
-      const idleColor = led.mode === 'Off' ? { r: 0, g: 0, b: 0 } : hexToRgb(led.idle)
+      const activeKeys = chord.notes.filter(isPartyKeysNote).map(noteToKeyIndex)
+      const idleKeys = Array.from({ length: PARTYKEYS_RANGE.count }, (_, position) => position).filter((position) => !activeKeys.includes(position))
+      const activeColor = led.mode === 'Off' ? { r: 0, g: 0, b: 0 } : scaleRgb(hexToRgb(chord.color), led.brightness / 100)
       setKeyColors(midiOutput.current, [
-        { color: idleColor, keys: idleKeys },
-        { color: { r: rgb.r * amount, g: rgb.g * amount, b: rgb.b * amount }, keys: activeKeys },
+        { color: ledIdleColor(), keys: idleKeys },
+        { color: activeColor, keys: activeKeys },
       ])
 
+      const chordAt = DEMO_BEATS_PER_CHORD * beatMs + index * chordMs
       const commitChord = () => {
         releaseDemoChord()
-        if (!silent) chord.notes.forEach((note) => engine.current.noteOn(note, 96))
+        if (!silent) chord.notes.forEach((note) => engine.current.noteOn(note, DEMO_VELOCITY))
         demoChordNotes.current = silent ? [] : chord.notes
-        setActiveNotes(new Set(chord.notes))
+        setActiveNotes(new Map(chord.notes.map((note) => [note, DEMO_VELOCITY])))
         setDemo({ open: false, status: 'playing', step, beat: 0, cycle, silent })
-        setLog((items) => [{ id: Date.now() + step, time: new Date().toLocaleTimeString([], { hour12: false }), type: 'Demo Chord', note: chord.name, velocity: 96, channel: 1 }, ...items].slice(0, 24))
+        setLog((items) => [{ id: `${Date.now()}-demo-${index}`, time: new Date().toLocaleTimeString([], { hour12: false }), type: 'Demo Chord', note: chord.name, velocity: DEMO_VELOCITY, channel: 1 }, ...items].slice(0, 24))
       }
 
-      if (midiOutput.current && led.latency > 0) queue(commitChord, led.latency)
+      // The LED frame goes out on the beat; audio and visuals are held back by
+      // the measured panel latency so the two land together.
+      if (midiOutput.current && led.latency > 0) at(chordAt + led.latency, commitChord)
       else commitChord()
-      queue(() => playChord((step + 1) % DEMO_CHORDS.length, step === DEMO_CHORDS.length - 1 ? cycle + 1 : cycle), chordMs)
+      at(chordAt + chordMs, () => playChord(index + 1))
     }
 
-    queue(() => playChord(0, 0), beatMs * 4)
+    at(DEMO_BEATS_PER_CHORD * beatMs, () => playChord(0))
   }
 
   useEffect(() => () => {
     demoRun.current += 1
     clearDemoTimers()
-    engine.current.stop()
+    engine.current.dispose()
     if (uploadUrlRef.current) URL.revokeObjectURL(uploadUrlRef.current)
   }, [])
 
@@ -533,7 +633,7 @@ export default function App() {
           <audio ref={mediaRef} src={sample.url} preload="metadata" onLoadedMetadata={(event) => { const duration = event.currentTarget.duration || 0; setPlayback((state) => ({ ...state, duration })) }} onTimeUpdate={(event) => { const currentTime = event.currentTarget.currentTime; setPlayback((state) => ({ ...state, currentTime })) }} onCanPlay={() => setAudio((state) => ({ ...state, error: '' }))} onError={() => setAudio((state) => ({ ...state, started: false, loading: false, error: 'This browser could not decode that audio file. Try MP3, WAV, or AAC.' }))} onPlay={() => setPlayback((state) => ({ ...state, playing: true }))} onPause={() => setPlayback((state) => ({ ...state, playing: false }))} onEnded={() => { setPlayback((state) => ({ ...state, playing: false })); setAudio((state) => ({ ...state, started: false })) }} />
           {demo.status !== 'idle' && <DemoTransport demo={demo} onStop={stopDemo} />}
           <section className="keyboard-panel">
-            <div className="panel-topline"><strong>C3 — B5 / 36 keys</strong><div className={`effect-readout ${levels.effectActive ? 'active' : ''}`}><i /><span>{levels.effectActive ? 'Vocoder engaged' : audio.started ? 'Hold a key to engage' : 'Vocoder idle'}</span>{levels.effectActive && <b>{levels.wetDb.toFixed(1)} dB wet</b>}</div><div className="velocity-readout"><span>Velocity</span><b>{activeNotes.size ? '104' : '—'}</b><i /></div></div>
+            <div className="panel-topline"><strong>C3 — B5 / 36 keys</strong><div className={`effect-readout ${levels.effectActive ? 'active' : ''}`}><i /><span>{levels.effectActive ? 'Vocoder engaged' : audio.started ? 'Hold a key to engage' : 'Vocoder idle'}</span>{levels.effectActive && <b>{levels.wetDb.toFixed(1)} dB wet</b>}</div><div className="velocity-readout"><span>Velocity</span><b>{activeNotes.size ? Math.round([...activeNotes.values()].reduce((sum, value) => sum + value, 0) / activeNotes.size) : '—'}</b><i /></div></div>
             <Piano activeNotes={activeNotes} onNoteOn={noteOn} onNoteOff={noteOff} />
           </section>
 
@@ -559,10 +659,10 @@ export default function App() {
 
         <aside className="patch-strip" id="patches">
           <div className="strip-label">Patch</div>
-          <div className="patch-title"><button aria-label="Previous patch">‹</button><strong>{activePreset}</strong><button aria-label="Next patch">›</button></div>
+          <div className="patch-title"><button aria-label="Previous patch" onClick={() => stepPreset(-1)}>‹</button><strong>{activePreset}</strong><button aria-label="Next patch" onClick={() => stepPreset(1)}>›</button></div>
           <div className="strip-label preset-label">Presets</div>
-          <div className="preset-list">{Object.keys(PRESETS).map((preset) => <button key={preset} className={preset === activePreset ? 'active' : ''} onClick={() => applyPreset(preset)}>{preset}{preset === activePreset && <span className="preset-bars">▮▯▮</span>}</button>)}</div>
-          <button className="save-button"><Icon name="save" size={17} /> Save patch</button>
+          <div className="preset-list">{Object.keys(patches).map((preset) => <button key={preset} className={preset === activePreset ? 'active' : ''} onClick={() => applyPreset(preset)}>{preset}{preset === activePreset && <span className="preset-bars">▮▯▮</span>}</button>)}</div>
+          <button className="save-button" onClick={savePatch}><Icon name="save" size={17} /> Save patch</button>
           <div className="patch-note"><span>Vocoder engine</span><strong>{settings.bands} bands</strong><small>{Math.round(settings.attack)} ms attack · {Math.round(settings.release)} ms release</small></div>
         </aside>
       </div>

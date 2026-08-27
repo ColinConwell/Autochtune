@@ -37,9 +37,20 @@ preview:
 # Tests + diagnostics
 # ---------------------------------------------------------------------------
 
+# Every offline test suite
+test: test-routing test-vocoder test-controller
+
 # Offline audio-routing assertions (monitor vs keyed vocoder)
-test:
+test-routing:
     node scripts/audio-routing-test.mjs
+
+# Vocoder DSP specification: filter bank, levels, gate, speech, robustness
+test-vocoder:
+    node scripts/vocoder-spec-test.mjs
+
+# Controller specification: MIDI parsing, PartyKeys SysEx, note-to-carrier
+test-controller:
+    node scripts/controller-test.mjs
 
 # Vocoder diagnostic against the bundled Prufrock sample
 diagnose *args:
